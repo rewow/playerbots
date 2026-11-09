@@ -313,6 +313,15 @@ bool RandomItemMgr::CanEquipItem(BotEquipKey key, ItemPrototype const* proto)
         requiredLevel = GetMinLevelFromCache(proto->ItemId);
     }
     if (!requiredLevel)
+    {
+        // World-drop items frequently have RequiredLevel 0 and no quest source,
+        // so the info cache has no minLevel for them either. Fall back to the
+        // item level instead of rejecting the item outright: otherwise items
+        // like the low-level green bows (needed by warriors/rogues for the
+        // "shoot" pull) can never enter the equipment cache.
+        requiredLevel = proto->ItemLevel;
+    }
+    if (!requiredLevel)
         return false;
 
     return true;
@@ -1438,6 +1447,16 @@ void RandomItemMgr::BuildItemInfoCache()
 
                 // Make wand useful
                 if (!statW && cacheInfo->slot == EQUIPMENT_SLOT_RANGED && proto->SubClass == ITEM_SUBCLASS_WEAPON_WAND && (clazz == CLASS_PRIEST || clazz == CLASS_MAGE || clazz == CLASS_WARLOCK))
+                    statW = 1;
+
+                // Make a stat-less ranged weapon useful: warriors and rogues need a
+                // bow/gun/crossbow (or thrown) for the "shoot" pull, and low-level
+                // ones usually carry no stats at all, so they would weigh 0 and
+                // never enter the equipment cache.
+                if (!statW && cacheInfo->slot == EQUIPMENT_SLOT_RANGED &&
+                    (proto->SubClass == ITEM_SUBCLASS_WEAPON_BOW || proto->SubClass == ITEM_SUBCLASS_WEAPON_GUN ||
+                     proto->SubClass == ITEM_SUBCLASS_WEAPON_CROSSBOW || proto->SubClass == ITEM_SUBCLASS_WEAPON_THROWN) &&
+                    (clazz == CLASS_WARRIOR || clazz == CLASS_ROGUE || clazz == CLASS_HUNTER))
                     statW = 1;
 
                 // Random properties
@@ -3429,6 +3448,13 @@ void RandomItemMgr::BuildEquipCache()
                                     continue;
 
                                 uint32 minLevel = GetMinLevelFromCache(itemId);
+                                if (!minLevel)
+                                {
+                                    // No required level and no quest source (common for
+                                    // world drops): use the item level as a proxy, otherwise
+                                    // the level band below drops the item at every level.
+                                    minLevel = proto->ItemLevel;
+                                }
                                 // skip higher level (e.g. quest rewards)
                                 if (minLevel > level)
                                     continue;
@@ -3550,7 +3576,7 @@ void RandomItemMgr::BuildPotionCache()
 
     sLog.outBasic("Building potion cache for %d levels", maxLevel);
 	int counter2 = 0;
-    for (uint32 level = 1; level <= maxLevel+1; level+=10)
+    for (uint32 level = 1; level <= maxLevel; level+=10)
     {
         uint32 effects[] = { SPELL_EFFECT_HEAL, SPELL_EFFECT_ENERGIZE };
         for (int i = 0; i < 2; ++i)
@@ -3568,7 +3594,9 @@ void RandomItemMgr::BuildPotionCache()
                     proto->Bonding != NO_BIND)
                     continue;
 
-                if (proto->RequiredLevel && (proto->RequiredLevel > level || proto->RequiredLevel < level - 10))
+                const uint32 highestLevel = std::min<uint32>(maxLevel, level + 9);
+                const uint32 lowestLevel = level > 10 ? level - 10 : 0;
+                if (proto->RequiredLevel && (proto->RequiredLevel > highestLevel || proto->RequiredLevel < lowestLevel))
                     continue;
 
                 if (proto->RequiredSkill)
@@ -3588,7 +3616,9 @@ void RandomItemMgr::BuildPotionCache()
 
                     for (int i = 0 ; i < 3; i++)
                     {
-                        if (spellInfo->Effect[i] == effect)
+                        // Energize also covers rage and energy potions, which are not mana potions.
+                        if (spellInfo->Effect[i] == effect &&
+                            (effect != SPELL_EFFECT_ENERGIZE || spellInfo->EffectMiscValue[i] == POWER_MANA))
                         {
                             potionCache[level / 10][effect].push_back(itemId);
                             break;
@@ -3599,7 +3629,7 @@ void RandomItemMgr::BuildPotionCache()
         }
     }
 
-    for (uint32 level = 1; level <= maxLevel+1; level+=10)
+    for (uint32 level = 1; level <= maxLevel; level+=10)
     {
         uint32 effects[] = { SPELL_EFFECT_HEAL, SPELL_EFFECT_ENERGIZE };
         for (int i = 0; i < 2; ++i)
@@ -3673,7 +3703,16 @@ void RandomItemMgr::BuildFoodCache()
 
 uint32 RandomItemMgr::GetRandomPotion(uint32 level, uint32 effect)
 {
-    std::vector<uint32> potions = potionCache[(level - 1) / 10][effect];
+    if (!level)
+        return 0;
+    std::vector<uint32> potions;
+    for (uint32 itemId : potionCache[(level - 1) / 10][effect])
+    {
+        ItemPrototype const* proto = sObjectMgr.GetItemPrototype(itemId);
+        // The bucket covers ten levels, so check the caller's actual level.
+        if (proto && proto->RequiredLevel <= level)
+            potions.push_back(itemId);
+    }
     if (potions.empty()) return 0;
     return potions[urand(0, potions.size() - 1)];
 }

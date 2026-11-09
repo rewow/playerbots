@@ -45,9 +45,8 @@ bool TradeStatusAction::Execute(Event& event)
 
     if (status == TRADE_STATUS_TRADE_ACCEPT || (status == TRADE_STATUS_BACK_TO_TRADE && trader->GetTradeData() && trader->GetTradeData()->IsAccepted()))
     {
-        WorldPacket p;
-        uint32 status = 0;
-        p << status;
+        WorldPacket p(CMSG_ACCEPT_TRADE, 4);
+        p << uint32(trader->GetTradeData()->GetServerStateIndex()); // the version of the trader's offer the bot accepts
 
         uint32 discount = sRandomPlayerbotMgr.GetTradeDiscount(bot, trader);
         if (CheckTrade())
@@ -55,20 +54,32 @@ bool TradeStatusAction::Execute(Event& event)
             int32 botMoney = CalculateCost(bot, true);
 
             std::map<uint32, uint32> givenItemIds, takenItemIds;
+            // the trade data may also be gone after a trade refused for lack of room:
+            // an offered item still held by its owner tells that the trade did not go through
+            ObjectGuid offeredItem;
+            Player* offeredBy = nullptr;
             for (uint32 slot = 0; slot < TRADE_SLOT_TRADED_COUNT; ++slot)
             {
                 Item* item = trader->GetTradeData()->GetItem((TradeSlots)slot);
                 if (item)
+                {
                     givenItemIds[item->GetProto()->ItemId] += item->GetCount();
+                    offeredItem = item->GetObjectGuid();
+                    offeredBy = trader;
+                }
 
                 item = bot->GetTradeData()->GetItem((TradeSlots)slot);
                 if (item)
+                {
                     takenItemIds[item->GetProto()->ItemId] += item->GetCount();
+                    offeredItem = item->GetObjectGuid();
+                    offeredBy = bot;
+                }
             }
 
             bot->GetSession()->HandleAcceptTradeOpcode(p);
 
-            if (bot->GetTradeData())
+            if (bot->GetTradeData() || (offeredBy && offeredBy->GetItemByGuid(offeredItem)))
             {
                 sRandomPlayerbotMgr.SetTradeDiscount(bot, trader, discount);
                 return false;

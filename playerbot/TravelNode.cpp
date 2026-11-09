@@ -1460,7 +1460,11 @@ void TravelNodeMap::fullLinkNode(TravelNode* startNode, Unit* bot)
 std::vector<TravelNode*> TravelNodeMap::getNodes(WorldPosition pos, float range, uint32 transportEntry)
 {
     std::vector<TravelNode*> retVec;
-    for (auto& node : m_map_nodes[pos.getMapId()])
+    auto mapNodes = m_map_nodes.find(pos.getMapId());
+    if (mapNodes == m_map_nodes.end())
+        return retVec;
+
+    for (auto& node : mapNodes->second)
     {
         if (range >= 0 && node->getDistance(pos) > range)
             continue;
@@ -1901,7 +1905,8 @@ TravelPath TravelNodeMap::getFullPath(WorldPosition startPos, WorldPosition endP
     //[[Node pathfinding system]]
                 //We try to find nodes near the bot and near the end position that have a route between them.
                 //Then bot has to move towards/along the route.
-    sTravelNodeMap.m_nMapMtx.lock_shared();
+    // Failed routes and exceptions must release the map lock too.
+    std::shared_lock<std::shared_timed_mutex> routeLock(sTravelNodeMap.m_nMapMtx);
 
     //Find the route of nodes starting at a node closest to the start position and ending at a node closest to the endposition.
     //Also returns longPath: The path from the start position to the first node in the route.
@@ -1916,8 +1921,6 @@ TravelPath TravelNodeMap::getFullPath(WorldPosition startPos, WorldPosition endP
     movePath = route.buildPath(beginPath, endPath);
 
     route.cleanTempNodes();
-
-    sTravelNodeMap.m_nMapMtx.unlock_shared();
 
     return movePath;
 }
@@ -2050,6 +2053,8 @@ void TravelNodeMap::manageNodes(Unit* bot, bool mapFull)
             }
 
         }
+
+        calculateCoverage();
 
         if (rePrint && (mapFull || !urand(0, 20)))
             printMap();
@@ -3197,7 +3202,12 @@ void TravelNodeMap::generateAll()
     }
 
     sLog.outString("-Calculating coverage"); //This prevents crashes when bots from multiple maps try to calculate this on the fly.
-    for (auto& node : getNodes())
+    calculateCoverage();
+}
+
+void TravelNodeMap::calculateCoverage()
+{
+    for (auto& node : m_nodes)
         node->hasRouteTo(node);
 }
 

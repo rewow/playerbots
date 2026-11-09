@@ -425,7 +425,11 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
         // normal landing
         if (!fallAfterJump)
         {
+#ifdef MANGOSBOT_ZERO
             bot->m_movementInfo.AddMovementFlag(MOVEFLAG_FALLINGFAR);
+#else
+            bot->m_movementInfo.AddMovementFlag(MOVEFLAG_PENDINGSTOP);
+#endif
 
             WorldPacket stop(MSG_MOVE_STOP);
 #ifdef MANGOSBOT_TWO
@@ -2567,10 +2571,6 @@ void PlayerbotAI::DoNextAction(bool min)
     {
         if (bot->m_movementInfo.HasMovementFlag(MOVEFLAG_FLYING))
             bot->m_movementInfo.RemoveMovementFlag(MOVEFLAG_FLYING);
-#ifdef MANGOSBOT_ONE
-        if (bot->m_movementInfo.HasMovementFlag(MOVEFLAG_FLYING2))
-            bot->m_movementInfo.RemoveMovementFlag(MOVEFLAG_FLYING2);
-#endif
         if (bot->m_movementInfo.HasMovementFlag(MOVEFLAG_CAN_FLY))
             bot->m_movementInfo.RemoveMovementFlag(MOVEFLAG_CAN_FLY);
         if (bot->m_movementInfo.HasMovementFlag(MOVEFLAG_LEVITATING))
@@ -3260,6 +3260,9 @@ std::vector<std::pair<const Quest*, uint32>> PlayerbotAI::GetCurrentQuestsRequir
 
         QuestStatus status = bot->GetQuestStatus(questId);
         const Quest* quest = sObjectMgr.GetQuestTemplate(questId);
+        if (!quest)
+            continue;
+
         for (uint8 i = 0; i < std::size(quest->ReqItemId); ++i)
         {
             if (quest->ReqItemId[i] == itemId)
@@ -4925,7 +4928,9 @@ bool PlayerbotAI::CastSpell(uint32 spellId, Unit* target, Item* itemTarget, bool
 	//bot->clearUnitState(UNIT_STAT_FOLLOW);
 
 	bool failWithDelay = false;
-    if (!bot->IsStandState())
+    // Respect native seated-casting permissions for eating and drinking.
+    SpellEntry const* sitCheckInfo = sServerFacade.LookupSpellInfo(spellId);
+    if (!bot->IsStandState() && !(sitCheckInfo && sitCheckInfo->HasAttribute(SPELL_ATTR_ALLOW_WHILE_SITTING)))
     {
         bot->SetStandState(UNIT_STAND_STATE_STAND);
         failWithDelay = true;
@@ -8666,8 +8671,14 @@ void PlayerbotAI::EnchantItemT(uint32 spellid, uint8 slot, Item* item)
       return;
    }
 
-   if (!((1 << pItem->GetProto()->SubClass) & spellInfo->EquippedItemSubClassMask) &&
-      !((1 << pItem->GetProto()->InventoryType) & spellInfo->EquippedItemInventoryTypeMask))
+   // Every restriction the spell sets must match, not just one of them: a ring
+   // otherwise passes on the sub class bit alone and gets a chest enchant.
+   if ((spellInfo->EquippedItemClass >= 0 &&
+        uint32(spellInfo->EquippedItemClass) != pItem->GetProto()->Class) ||
+       (spellInfo->EquippedItemSubClassMask &&
+        !((uint32(1) << pItem->GetProto()->SubClass) & uint32(spellInfo->EquippedItemSubClassMask))) ||
+       (spellInfo->EquippedItemInventoryTypeMask &&
+        !((uint32(1) << pItem->GetProto()->InventoryType) & uint32(spellInfo->EquippedItemInventoryTypeMask))))
    {
 
       sLog.outError("%s: items could not be enchanted, wrong item type equipped", bot->GetName());
@@ -8771,21 +8782,10 @@ bool PlayerbotAI::CanMove()
     {
         return false;
     }
-#ifdef MANGOSBOT_ONE
     if (bot->IsFalling())
     {
         return false;
     }
-    if (bot->IsJumping())
-    {
-        return false;
-    }
-#else
-    if (bot->IsFalling())
-    {
-        return false;
-    }
-#endif
 
     MotionMaster& mm = *bot->GetMotionMaster();
     MovementGeneratorType currentMotion = mm.GetCurrentMovementGeneratorType();
