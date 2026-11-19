@@ -1,6 +1,7 @@
 #include "PlayerbotMgr.h"
 #include "playerbot/playerbot.h"
 #include <stdarg.h>
+#include <algorithm>
 #include <iomanip>
 
 #include "playerbot/AiFactory.h"
@@ -31,6 +32,7 @@
 #include "Maps/InstanceData.h"
 #include "ChatHelper.h"
 #include "strategy/values/BudgetValues.h"
+#include "strategy/values/MountValues.h"
 #include "Social/SocialMgr.h"
 #include "PlayerbotTextMgr.h"
 #include "RandomItemMgr.h"
@@ -80,7 +82,8 @@ void PacketHandlingHelper::AddHandler(uint16 opcode, std::string handler, bool s
 
 void PacketHandlingHelper::Handle(ExternalEventHelper &helper)
 {
-    if (!m_botPacketMutex.try_lock()) //Packets do not have to be handled now. Handle them later.
+    std::unique_lock<std::mutex> lock(m_botPacketMutex, std::try_to_lock);
+    if (!lock.owns_lock() || queue.empty()) //Packets do not have to be handled now. Handle them later.
         return;
 
     std::stack<WorldPacket> delayed;
@@ -89,13 +92,11 @@ void PacketHandlingHelper::Handle(ExternalEventHelper &helper)
     {
         if (!helper.HandlePacket(handlers, queue.top()))
             if(delay[queue.top().GetOpcode()])
-                delayed.push(queue.top());
+                delayed.push(std::move(queue.top()));
         queue.pop();
     }
 
-    queue = delayed;
-
-    m_botPacketMutex.unlock();
+    queue.swap(delayed);
 }
 
 void PacketHandlingHelper::AddPacket(const WorldPacket& packet)
@@ -612,7 +613,13 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
 #endif
 
     // Only update the internal ai when no reaction is running and the internal ai can be updated
-    if(!UpdateAIReaction(elapsed, doMinimalReaction, bot->IsTaxiFlying()) && CanUpdateAIInternal())
+    bool reactionRunning = UpdateAIReaction(elapsed, doMinimalReaction, bot->IsTaxiFlying());
+
+    if (Group const* group = bot->GetGroup();
+        group && !reactionRunning && !inCombat && !isWaiting && TryMountWithGroupMaster(*group))
+        return;
+
+    if (!reactionRunning && CanUpdateAIInternal())
     {
         // Update the delay with the spell cast time
         Spell* currentSpell = bot->GetCurrentSpell(CURRENT_GENERIC_SPELL);
@@ -639,6 +646,25 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
 
         YieldAIInternalThread(min);
     }
+}
+
+bool PlayerbotAI::TryMountWithGroupMaster(Group const& group)
+{
+    ObjectGuid const leaderGuid = group.GetLeaderGuid();
+    if (!leaderGuid || leaderGuid == bot->GetObjectGuid() || group.IsBattleGroup() ||
+        !bot->IsInWorld() || !bot->IsAlive() || bot->IsMounted() || bot->IsBeingTeleported() ||
+        bot->GetTransport() || bot->GetSession()->isLogingOut() ||
+        bot->IsNonMeleeSpellCasted(false, false, true))
+        return false;
+
+    Player* leader = master && master->GetObjectGuid() == leaderGuid ? master : bot->GetMap()->GetPlayer(leaderGuid);
+    if (!IsSafe(leader) || !leader->IsInWorld() || !MountValue::IsMountCast(leader->GetCurrentSpell(CURRENT_GENERIC_SPELL)))
+        return false;
+
+    if (!HasStrategy("follow", BotState::BOT_STATE_NON_COMBAT) && !HasStrategy("wander", BotState::BOT_STATE_NON_COMBAT))
+        return false;
+
+    return DoSpecificAction("check mount state", Event("group master mount cast"), true);
 }
 
 bool PlayerbotAI::UpdateAIReaction(uint32 elapsed, bool minimal, bool isStunned)
@@ -1398,23 +1424,31 @@ void PlayerbotAI::UpdateAIInternal(uint32 elapsed, bool minimal)
     ExternalEventHelper helper(aiObjectContext);
 
     // chat replies
-    std::list<ChatQueuedReply> delayedResponses;
+    std::queue<ChatQueuedReply> pendingReplies;
     {
         std::scoped_lock lock(chatRepliesMutex);
-        while (!chatReplies.empty())
-        {
-            ChatQueuedReply holder = chatReplies.front();
-            time_t checkTime = holder.m_time;
-            if (checkTime && time(0) < checkTime)
-            {
-                delayedResponses.push_back(holder);
-                chatReplies.pop();
-                continue;
-            }
-            ChatReplyAction::ChatReplyDo(bot, holder.m_type, holder.m_guid1, holder.m_guid2, holder.m_msg, holder.m_chanName, holder.m_name);
-            chatReplies.pop();
-        }
+        if (!chatReplies.empty())
+            pendingReplies.swap(chatReplies);
+    }
 
+    std::list<ChatQueuedReply> delayedResponses;
+    while (!pendingReplies.empty())
+    {
+        ChatQueuedReply holder = pendingReplies.front();
+        time_t checkTime = holder.m_time;
+        if (checkTime && time(0) < checkTime)
+        {
+            delayedResponses.push_back(holder);
+            pendingReplies.pop();
+            continue;
+        }
+        ChatReplyAction::ChatReplyDo(bot, holder.m_type, holder.m_guid1, holder.m_guid2, holder.m_msg, holder.m_chanName, holder.m_name);
+        pendingReplies.pop();
+    }
+
+    if (!delayedResponses.empty())
+    {
+        std::scoped_lock lock(chatRepliesMutex);
         for (std::list<ChatQueuedReply>::iterator i = delayedResponses.begin(); i != delayedResponses.end(); ++i)
         {
             chatReplies.push(*i);
@@ -4095,9 +4129,13 @@ bool PlayerbotAI::HasAura(std::string name, Unit* unit, bool maxStack, bool chec
     if (!unit)
         return false;
 
+    const bool noAuras = unit->GetSpellAuraHolderMap().empty();
+    if (noAuras && maxAuraAmount != 0)
+        return false;
+
     std::wstring wnamepart;
 
-    std::vector<uint32> ids = chatHelper.SpellIds(name);
+    const auto& ids = chatHelper.SpellIds(name);
 
     if (ids.empty())
     {
@@ -4108,14 +4146,27 @@ bool PlayerbotAI::HasAura(std::string name, Unit* unit, bool maxStack, bool chec
         wstrToLower(wnamepart);
     }
 
+    if (noAuras)
+        return maxAuraAmount == 0;
+
+    int firstType = SPELL_AURA_BIND_SIGHT;
+    int endType = TOTAL_AURAS;
+    if (auraTypeId != TOTAL_AURAS)
+    {
+        if (auraTypeId < firstType || auraTypeId >= endType)
+            return maxAuraAmount == 0;
+
+        firstType = auraTypeId;
+        endType = auraTypeId + 1;
+    }
+    else if (!ids.empty() && std::none_of(ids.begin(), ids.end(), [unit](uint32 id) { return unit->HasAura(id); }))
+        return maxAuraAmount == 0;
+
     int auraAmount = 0;
 
-	for (uint32 auraType = SPELL_AURA_BIND_SIGHT; auraType < TOTAL_AURAS; auraType++)
-	{
-        if (auraTypeId != TOTAL_AURAS && auraType != auraTypeId)
-            continue;
-
-		Unit::AuraList const& auras = unit->GetAurasByType((AuraType)auraType);
+    for (int auraType = firstType; auraType < endType; ++auraType)
+    {
+        Unit::AuraList const& auras = unit->GetAurasByType((AuraType)auraType);
 
         if (auras.empty())
             continue;
@@ -4228,10 +4279,10 @@ Aura* PlayerbotAI::GetAura(uint32 spellId, Unit* unit, bool checkIsOwner)
 
 Aura* PlayerbotAI::GetAura(std::string name, Unit* unit, bool checkIsOwner)
 {
-    if (!name.empty() && unit)
+    if (!name.empty() && unit && !unit->GetSpellAuraHolderMap().empty())
     {
         std::wstring wnamepart;
-        std::vector<uint32> ids = chatHelper.SpellIds(name);
+        const auto& ids = chatHelper.SpellIds(name);
 
         if (ids.empty())
         {
@@ -4241,6 +4292,8 @@ Aura* PlayerbotAI::GetAura(std::string name, Unit* unit, bool checkIsOwner)
 
             wstrToLower(wnamepart);
         }
+        else if (std::none_of(ids.begin(), ids.end(), [unit](uint32 id) { return unit->HasAura(id); }))
+            return nullptr;
 
         for (uint32 auraType = SPELL_AURA_BIND_SIGHT; auraType < TOTAL_AURAS; auraType++)
         {
@@ -4291,6 +4344,9 @@ Aura* PlayerbotAI::GetAura(std::string name, Unit* unit, bool checkIsOwner)
 std::vector<Aura*> PlayerbotAI::GetAuras(Unit* unit, bool allAuras, bool positive)
 {
     std::vector<Aura*> outAuras;
+    if (!unit || unit->GetSpellAuraHolderMap().empty())
+        return outAuras;
+
     for (uint32 auraType = SPELL_AURA_BIND_SIGHT; auraType < TOTAL_AURAS; auraType++)
     {
         Unit::AuraList const& auras = unit->GetAurasByType((AuraType)auraType);
@@ -6165,11 +6221,9 @@ bool IsAlliance(uint8 race)
 
 uint32 PlayerbotAI::GetFixedBotNumber(BotTypeNumber typeNumber, uint32 maxNum, float cyclePerMin, bool ignoreGuid)
 {
-    uint8 seedNumber = uint8(typeNumber);
-    std::mt19937 rng(seedNumber);
-    uint32 randseed = rng();                                       //Seed random number
-    uint32 randnum = randseed;                                     //Semi-random.
-    
+    static const uint32 activitySeed = std::mt19937(uint8(BotTypeNumber::ACTIVITY_TYPE_NUMBER))();
+    uint32 randnum = typeNumber == BotTypeNumber::ACTIVITY_TYPE_NUMBER ? activitySeed : std::mt19937(uint8(typeNumber))();
+
     if (!ignoreGuid)
         randnum += bot->GetGUIDLow();                              //but fixed number for each bot.
 
